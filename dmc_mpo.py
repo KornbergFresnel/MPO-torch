@@ -2,7 +2,6 @@ import argparse
 import os
 import pathlib
 import torch
-import ray
 import numpy as np
 import datetime
 import pprint
@@ -11,7 +10,7 @@ from gym import spaces
 
 from torch.utils.tensorboard import SummaryWriter
 
-from tianshou.trainer import offline_trainer
+from tianshou.trainer import offpolicy_trainer
 from tianshou.utils.net.common import Net
 from tianshou.utils import TensorboardLogger
 from tianshou.data import Collector, ReplayBuffer, VectorReplayBuffer
@@ -23,7 +22,7 @@ from mpo import MPOPolicy
 D4RL_DATASET = pathlib.Path.home() / ".d4rl/datasets"
 
 parser = argparse.ArgumentParser(description="Run training")
-parser.add_argument("--env-name", type=str, required=True)
+parser.add_argument("--task", type=str, required=True)
 parser.add_argument("--debug", action="store_true")
 parser.add_argument("--seed", type=int, default=0)
 parser.add_argument("--buffer-size", type=int, default=1000000)
@@ -53,10 +52,8 @@ parser.add_argument("--wandb-project", type=str, default="dmc.benchmarking")
 if __name__ == "__main__":
     args = parser.parse_args()
 
-    env_name = args.env_name
-
     env, train_envs, test_envs = make_dmc_env(
-        env_name=args.env_name,
+        task=args.task,
         seed=args.seed,
         training_num=args.training_num,
         test_num=args.test_num,
@@ -79,7 +76,9 @@ if __name__ == "__main__":
     )
     net_c = Net(
         state_shape=args.state_shape,
+        action_shape=args.action_shape,
         hidden_sizes=args.hidden_sizes,
+        concat=True,
         activation=torch.nn.Tanh,
         device=args.device,
     )
@@ -92,13 +91,14 @@ if __name__ == "__main__":
         ).to(args.device)
         critic = Critic(net_c, device=args.device).to(args.device)
     else:
-        from tianshou.utils.net.continuous import Actor, Critic
+        from tianshou.utils.net.continuous import ActorProb, Critic
 
-        actor = Actor(
+        actor = ActorProb(
             preprocess_net=net_a,
             action_shape=args.action_shape,
             max_action=args.max_action,
             device=args.device,
+            unbounded=False,
         ).to(args.device)
         critic = Critic(preprocess_net=net_c, device=args.device).to(args.device)
 
@@ -112,6 +112,7 @@ if __name__ == "__main__":
         actor_optim=actor_optim,
         critic=critic,
         critic_optim=critic_optim,
+        device=args.device,
     )
 
     # collector
@@ -130,22 +131,21 @@ if __name__ == "__main__":
     log_path = os.path.join(args.logdir, log_name)
 
     writer = SummaryWriter(log_path)
-    writer.add_text("args", args)
 
     logger = TensorboardLogger(writer)
 
     def save_best_fn(policy):
         torch.save(policy.state_dict(), os.path.join(log_path, "policy.pth"))
 
-    result = offline_trainer(
-        policy,
-        train_collector,
-        test_collector,
-        args.epoch,
-        args.step_per_epoch,
-        args.step_per_collect,
-        args.test_num,
-        args.batch_size,
+    result = offpolicy_trainer(
+        policy=policy,
+        train_collector=train_collector,
+        test_collector=test_collector,
+        max_epoch=args.epoch,
+        step_per_epoch=args.step_per_epoch,
+        step_per_collect=args.step_per_collect,
+        episode_per_test=args.test_num,
+        batch_size=args.batch_size,
         save_best_fn=save_best_fn,
         logger=logger,
         update_per_step=args.update_per_step,

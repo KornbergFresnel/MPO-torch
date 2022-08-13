@@ -41,8 +41,8 @@ def get_dist_fn(discrete: bool):
     else:
 
         def fn(logits):
-            return torch.distributions.MultivariateNormal(
-                loc=logits[:, 0], scale_tril=logits[:, 1]
+            return torch.distributions.Independent(
+                torch.distributions.Normal(*logits), 1
             )
 
         return fn
@@ -114,6 +114,7 @@ class MPOPolicy(BasePolicy):
         estimation_step: int = 1,
         action_scaling: bool = True,
         action_bound_method: str = "clip",
+        device: str = "cpu",
         **kwargs: Any,
     ) -> None:
         super().__init__(
@@ -154,6 +155,7 @@ class MPOPolicy(BasePolicy):
         self._discrete_act = isinstance(actor, DiscreteActor)
         self._obs_dim = obs_dim
         self._act_dim = act_dim
+        self._device = device
         self._norm_critic_loss = (
             torch.nn.MSELoss() if critic_loss_type == "mse" else torch.nn.SmoothL1Loss()
         )
@@ -173,8 +175,8 @@ class MPOPolicy(BasePolicy):
             MPOPolicy: MPO policy instance.
         """
 
-        self.actor(mode)
-        self.critic(mode)
+        self.actor.train(mode)
+        self.critic.train(mode)
         return self
 
     def sync_weight(self) -> None:
@@ -193,44 +195,20 @@ class MPOPolicy(BasePolicy):
     def process_fn(
         self, batch: Batch, buffer: ReplayBuffer, indices: np.ndarray
     ) -> Batch:
-        with torch.no_grad():
-            policy = self.actor(batch.obs)
-            action_values = self.critic(batch.obs)
-            state_values = (policy * action_values).sum(1, keepdim=True)
-            next_policy = self.actor(batch.obs_next)
-            next_action_values = self.critic(batch.obs_next)
-            next_state_values = (next_policy * next_action_values).sum(1, keepdim=True)
-            log_prob = torch.distributions.Categorical(probs=policy).log_prob(
-                batch.actions
-            )
 
-        # TODO(ming): reshape rewar
-        rho = self._alpha * (batch.old_log_prob - log_prob)
-        if isinstance(batch.rew, torch.Tensor):
-            old_rew_np = batch.rew.cpu().numpy()
-        else:
-            old_rew_np = batch.rew.copy()
-
-        batch.rew = batch.rew - rho
+        super().post_process_fn(batch, buffer, indices)
         returns, advantages = self.compute_episodic_return(
             batch,
             buffer,
             indices,
-            next_state_values,
-            state_values,
             gamma=self._gamma,
-            gae_lambda=0.95,
+            gae_lambda=1.0,
         )
 
-        # recover rew
-        batch.rew = old_rew_np
-
-        batch["state_values"] = state_values
-        batch["next_state_values"] = next_state_values
         batch["returns"] = returns
         batch["advantages"] = advantages
 
-        batch.to_torch()
+        batch.to_torch(device=self._device)
 
         return batch
 
@@ -253,8 +231,11 @@ class MPOPolicy(BasePolicy):
             else:
                 actions = logits[0]  # get means as actions
         else:
-            actions = self.dist_fn(logits).rsample()
+            actions = self.dist_fn(logits).sample()
 
+        # clip actions
+        if not self._discrete_act:
+            actions = torch.clip(actions, -1.0, 1.0)
         return Batch(act=actions, state=hidden)
 
     def critic_update(self, batch: Batch, particle_num: int = 64):
@@ -271,17 +252,15 @@ class MPOPolicy(BasePolicy):
 
             # get expected Q vaue from target critic
             next_q_values = self.critic_old(
-                expaned_next_states.reshape(-1, self._obs_dim)
+                expaned_next_states.reshape(-1, self._obs_dim),
+                sampled_next_actions.reshape(-1, self._act_dim),
             )
-            next_state_values = next_q_values.gather(
-                -1, sampled_next_actions.reshape(-1, self._act_dim).long()
-            )
-            next_state_values = next_state_values.reshape(batch_size, -1).mean(-1)
+            next_state_values = next_q_values.reshape(batch_size, -1).mean(-1)
 
             y = batch.rew + self._gamma * next_state_values
 
         self.critic_optim.zero_grad()
-        q_values = self.critic(batch.obs).squeeze()
+        q_values = self.critic(batch.obs, batch.act).squeeze()
         loss = self._norm_critic_loss(q_values, y)
         loss.backward()
         torch.nn.utils.clip_grad_norm_(self.criti.parameters(), self._critic_grad_norm)
@@ -307,10 +286,8 @@ class MPOPolicy(BasePolicy):
                 particle_num, batch_size, -1
             )  # (K, batch_size, obs_dim)
             target_q = self.critic_old(
-                expanded_states.reshape(-1, self._obs_dim)
-            )  # (K*batch_size, act_dim)
-            target_q = target_q.gather(
-                -1, sampled_actions.reshape(-1, self._act_dim).long()
+                expanded_states.reshape(-1, self._obs_dim),
+                sampled_actions.reshape(-1, self._act_dim),
             ).reshape(
                 particle_num, batch_size
             )  # (K, batch_size)
@@ -369,6 +346,8 @@ class MPOPolicy(BasePolicy):
         if self._noise is None:
             return act
         if isinstance(act, np.ndarray):
-            return act + self._noise(act.shape)
+            act = act + self._noise(act.shape)
+            if not self._discrete_act:
+                act = np.clip(act, a_min=-1.0, a_max=1.0)
         warnings.warn("Cannot add exploration noise to non-numpy_array action.")
         return act
