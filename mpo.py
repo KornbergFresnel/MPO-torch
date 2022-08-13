@@ -15,31 +15,88 @@ from scipy.optimize import minimize
 from tianshou.data import Batch, ReplayBuffer
 from tianshou.exploration import BaseNoise, GaussianNoise
 from tianshou.policy import BasePolicy
+from tianshou.utils.net.continuous import Actor as ContinuousActor
+from tianshou.utils.net.discrete import Actor as DiscreteActor
 
 
-def _dual(
-    behavior_policy: np.ndarray, target_q: np.ndarray, eta: float, epsilon: float
-):
+def _dual(target_q: np.ndarray, eta: float, epsilon: float):
     """Dual function of the non-parametric variational
 
     g(eta) = eta * dual_constraint + eta \sum \log(\sum\exp(Q(s,a)/eta))
     """
 
-    max_q = np.max(target_q, 0)
+    max_q = np.max(target_q, -1)
     new_eta = (
         eta * epsilon
         + np.mean(max_q)
         + eta
-        * np.mean(
-            np.log(np.sum(behavior_policy * np.exp((target_q - max_q) / eta), axis=0))
-        )
+        * np.mean(np.log(np.mean(np.exp((target_q - max_q[:, None]) / eta), axis=1)))
     )
     return new_eta
+
+
+def get_dist_fn(discrete: bool):
+    if discrete:
+        return torch.distributions.Categorical
+    else:
+
+        def fn(logits):
+            return torch.distributions.MultivariateNormal(
+                loc=logits[:, 0], scale_tril=logits[:, 1]
+            )
+
+        return fn
+
+
+def btr(m):
+    return m.diagonal(dim1=-2, dim2=-1).sum(-1)
+
+
+def bt(m):
+    return m.transpose(dim0=-2, dim1=-1)
+
+
+def gaussian_kl(mu_i, mu, Ai, A):
+    """
+    decoupled KL between two multivariate gaussian distribution
+    C_mu = KL(f(x|mu_i,sigma_i)||f(x|mu,sigma_i))
+    C_sigma = KL(f(x|mu_i,sigma_i)||f(x|mu_i,sigma))
+    :param mu_i: (B, n)
+    :param mu: (B, n)
+    :param Ai: (B, n, n)
+    :param A: (B, n, n)
+    :return: C_mu, C_sigma: scalar
+        mean and covariance terms of the KL
+    :return: mean of determinanats of sigma_i, sigma
+    """
+    n = A.size(-1)
+    mu_i = mu_i.unsqueeze(-1)  # (B, n, 1)
+    mu = mu.unsqueeze(-1)  # (B, n, 1)
+    sigma_i = Ai @ bt(Ai)  # (B, n, n)
+    sigma = A @ bt(A)  # (B, n, n)
+    sigma_i_det = sigma_i.det()  # (B,)
+    sigma_det = sigma.det()  # (B,)
+    sigma_i_det = torch.clamp_min(sigma_i_det, 1e-6)
+    sigma_det = torch.clamp_min(sigma_det, 1e-6)
+    sigma_i_inv = sigma_i.inverse()  # (B, n, n)
+    sigma_inv = sigma.inverse()  # (B, n, n)
+
+    inner_mu = (
+        (mu - mu_i).transpose(-2, -1) @ sigma_i_inv @ (mu - mu_i)
+    ).squeeze()  # (B,)
+    inner_sigma = (
+        torch.log(sigma_det / sigma_i_det) - n + btr(sigma_inv @ sigma_i)
+    )  # (B,)
+    C_mu = 0.5 * torch.mean(inner_mu)
+    C_sigma = 0.5 * torch.mean(inner_sigma)
+    return C_mu, C_sigma, torch.mean(sigma_i_det), torch.mean(sigma_det)
 
 
 class MPOPolicy(BasePolicy):
     def __init__(
         self,
+        obs_dim: int,
+        act_dim: int,
         actor: Optional[torch.nn.Module],
         actor_optim: Optional[torch.optim.Optimizer],
         critic: Optional[torch.nn.Module],
@@ -51,6 +108,7 @@ class MPOPolicy(BasePolicy):
         gamma: float = 0.99,
         actor_grad_norm: float = 5.0,
         critic_grad_norm: float = 5.0,
+        critic_loss_type: str = "mse",
         exploration_noise: Optional[BaseNoise] = GaussianNoise(sigma=0.1),
         reward_normalization: bool = False,
         estimation_step: int = 1,
@@ -93,6 +151,14 @@ class MPOPolicy(BasePolicy):
         self._lagrange_it = None
         self._actor_grad_norm = actor_grad_norm
         self._critic_grad_norm = critic_grad_norm
+        self._discrete_act = isinstance(actor, DiscreteActor)
+        self._obs_dim = obs_dim
+        self._act_dim = act_dim
+        self._norm_critic_loss = (
+            torch.nn.MSELoss() if critic_loss_type == "mse" else torch.nn.SmoothL1Loss()
+        )
+        self._mstep_iter_num = 10
+        self.dist_fn = get_dist_fn(self._discrete_act)
 
     def set_exp_noise(self, noise: Optional[BaseNoise]):
         self._noise = noise
@@ -178,52 +244,101 @@ class MPOPolicy(BasePolicy):
     ) -> Batch:
         model = getattr(self, model)
         obs = batch[input]
-        actions, hidden = model(obs, state=state, info=batch.info)
+        logits, hidden = model(obs, state=state, info=batch.info)
+
+        if not self.training:
+            # arg max
+            if self._discrete_act:
+                actions = F.softmax(logits, dim=-1).argmax(-1)
+            else:
+                actions = logits[0]  # get means as actions
+        else:
+            actions = self.dist_fn(logits).rsample()
+
         return Batch(act=actions, state=hidden)
+
+    def critic_update(self, batch: Batch, particle_num: int = 64):
+        batch_size = batch.obs.size(0)
+        with torch.no_grad():
+            logits, _ = self.actor_old(batch.obs_next)
+            policy: torch.distributions.Distribution = self.dist_fn(logits)
+            sampled_next_actions = policy.sample((particle_num,)).transpose(
+                0, 1
+            )  # (batch_size, sample_num, action_dim)
+            expaned_next_states = batch.obs_next[:, None, :].expand(
+                -1, particle_num, -1
+            )  # (batch_size, sample_num, obs_dim)
+
+            # get expected Q vaue from target critic
+            next_q_values = self.critic_old(
+                expaned_next_states.reshape(-1, self._obs_dim)
+            )
+            next_state_values = next_q_values.gather(
+                -1, sampled_next_actions.reshape(-1, self._act_dim).long()
+            )
+            next_state_values = next_state_values.reshape(batch_size, -1).mean(-1)
+
+            y = batch.rew + self._gamma * next_state_values
+
+        self.critic_optim.zero_grad()
+        q_values = self.critic(batch.obs).squeeze()
+        loss = self._norm_critic_loss(q_values, y)
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(self.criti.parameters(), self._critic_grad_norm)
+        self.critic_optim.step()
+        return loss, y
 
     def learn(self, batch: Batch, **kwargs: Any) -> Dict[str, Any]:
         batch_size = batch.obs.size(0)
 
         # compute critic loss
-        self.critic_optim.zero_grad()
-        critic_loss = F.mse_loss(self.critic(batch.obs), batch.returns)
+        particle_num = 64
+        critic_loss, q_label = self.critic_update(batch, particle_num=particle_num)
+        mean_est_q = q_label.abs().mean()
 
-        # build behavior/ref policies
-        sample_actions = (
-            torch.arange(self.action_dim)[..., None]
-            .expand(self.action_dim, batch_size)
-            .to(self.device)
-        )
-        # behavior_policy = self.actor_old(batch.obs)
-        # behavior_dist = torch.distributions.Categorical(probs=behavior_policy)
-        # behavior_action_prob = behavior_policy.expand((self.action_dim, batch_size)).log_prob(sample_actions).exp()
-        target_q = batch.target_q.detach()
-        target_q = target_q.transpose(0, 1)
-        ref_policy = torch.softmax(target_q / self._eta, dim=0)
+        # E-step for policy improvement
+        with torch.no_grad():
+            reference_logits, _ = self.actor_old(batch.obs)
+            reference_policy = self.dist_fn(reference_logits)
+            sampled_actions = reference_policy.sample(
+                (particle_num,)
+            )  # (K, batch_size, act_dim)
+            expanded_states = batch.obs[None, ...].expand(
+                particle_num, batch_size, -1
+            )  # (K, batch_size, obs_dim)
+            target_q = self.critic_old(
+                expanded_states.reshape(-1, self._obs_dim)
+            )  # (K*batch_size, act_dim)
+            target_q = target_q.gather(
+                -1, sampled_actions.reshape(-1, self._act_dim).long()
+            ).reshape(
+                particle_num, batch_size
+            )  # (K, batch_size)
+            target_q_np = target_q.cpu().transpose(0, 1).numpy()  # (batch_size, K)
 
-        # E-step
         self._eta = minimize(
             _dual,
-            ref_policy.cpu().numpy(),
-            target_q.cpu().numpy(),
+            target_q_np,
             self._eta,
             self._epsilon,
             method="SLSQP",
             bounds=[(1e-6, None)],
-        )
+        ).x[0]
 
         # M-step: update actor based on Lagrangian
         average_actor_loss = 0.0
-        for _ in range(self.lagrange_it):
-            policy = self.actor(batch.obs)
-            dist = torch.distributions.Categorical(probs=policy)
+        # normalize q
+        norm_target_q = F.softmax(target_q / self._eta, dim=0)  # (K, batch_size)
+        for _ in range(self._mstep_iter_num):
+            logits, _ = self.actor(batch.obs)
+            policy = self.dist_fn(logits)
             mle_loss = torch.mean(
-                ref_policy
-                * dist.expand((self.action_space.n, batch_size)).log_prob(
-                    sample_actions
-                )
+                norm_target_q
+                * policy.expand((particle_num, batch_size)).log_prob(sampled_actions)
+            )  # (K, batch_size)
+            kl_to_ref_policy = torch.distributions.kl.kl_divergence(
+                policy.probs, reference_policy.probs
             )
-            kl_to_ref_policy = torch.distributions.kl.kl_divergence(policy, ref_policy)
 
             # Update lagrange multipliers by gradient descent
             self._eta_kl -= (
@@ -242,7 +357,11 @@ class MPOPolicy(BasePolicy):
 
         self.sync_weight()
 
-        return {"loss/actor": average_actor_loss, "loss/critic": critic_loss.item()}
+        return {
+            "loss/actor": average_actor_loss,
+            "loss/critic": critic_loss.item(),
+            "est/q": mean_est_q.item(),
+        }
 
     def exploration_noise(
         self, act: Union[np.ndarray, Batch], batch: Batch
