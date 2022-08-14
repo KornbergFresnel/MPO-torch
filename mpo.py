@@ -64,13 +64,13 @@ class MPOPolicy(BasePolicy):
         actor_optim: Optional[torch.optim.Optimizer],
         critic: Optional[torch.nn.Module],
         critic_optim: Optional[torch.optim.Optimizer],
-        eta: float = 0.4,
         epsilon: float = 0.1,
         alpha: float = 1.0,
         tau: float = 0.005,
         gamma: float = 0.99,
         actor_grad_norm: float = 5.0,
         critic_grad_norm: float = 5.0,
+        mstep_iter_num: int = 5,
         critic_loss_type: str = "mse",
         exploration_noise: Optional[BaseNoise] = GaussianNoise(sigma=0.1),
         reward_normalization: bool = False,
@@ -108,11 +108,11 @@ class MPOPolicy(BasePolicy):
         self._n_step = estimation_step
 
         # initialize Lagrange multiplier
-        self._eta = eta
+        self._eta = np.random.rand()
         self._eta_kl = 0.0
+        self._epsilon_kl = 0.01
         self._epsilon = epsilon
         self._alpha = alpha
-        self._lagrange_it = None
         self._actor_grad_norm = actor_grad_norm
         self._critic_grad_norm = critic_grad_norm
         self._discrete_act = isinstance(actor, DiscreteActor)
@@ -122,7 +122,7 @@ class MPOPolicy(BasePolicy):
         self._norm_critic_loss = (
             torch.nn.MSELoss() if critic_loss_type == "mse" else torch.nn.SmoothL1Loss()
         )
-        self._mstep_iter_num = 10
+        self._mstep_iter_num = mstep_iter_num
         self.dist_fn = get_dist_fn(self._discrete_act)
 
     def set_exp_noise(self, noise: Optional[BaseNoise]):
@@ -288,7 +288,7 @@ class MPOPolicy(BasePolicy):
             average_kl += kl_to_ref_policy.item() / self._mstep_iter_num
 
             # Update lagrange multipliers by gradient descent
-            self._eta_kl -= self._alpha * (self._eta_kl - kl_to_ref_policy.item())
+            self._eta_kl -= self._alpha * (self._epsilon_kl - kl_to_ref_policy.item())
             self._eta_kl = max(self._eta_kl, 0.0)
 
             self.actor_optim.zero_grad()
@@ -308,7 +308,8 @@ class MPOPolicy(BasePolicy):
             "loss/actor": average_actor_loss,
             "loss/critic": critic_loss.item(),
             "est/q": mean_est_q.item(),
-            "est/kl_to_ref": average_kl,
+            "est/kl": average_kl,
+            "est/eta": self._eta,
         }
 
     def exploration_noise(
